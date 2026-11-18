@@ -2,18 +2,90 @@
 # Filtered by an explicit start/end date range on date_survey_received (inclusive)
 # Co-authored with CoCo
 
+import argparse
 import snowflake.connector
 import openpyxl
 import os
 import win32com.client
 from datetime import date
 from openpyxl.styles import PatternFill
+import glob
+
+
+def parse_date(value):
+    """Parse an ISO 8601 date (YYYY-MM-DD) and convert it to a date."""
+    try:
+        return date.fromisoformat(value.strip())
+    except (AttributeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"Invalid date '{value}'. Use YYYY-MM-DD (for example, 2026-11-03)."
+        )
+
+
+def prompt_for_date(prompt, default):
+    while True:
+        value = input(f"{prompt} (YYYY-MM-DD, default {default}): ").strip()
+        if not value:
+            return default
+        try:
+            return parse_date(value)
+        except argparse.ArgumentTypeError as exc:
+            print(exc)
+
+
+parser = argparse.ArgumentParser(description="Generate the NPS report")
+parser.add_argument("--start-date", type=parse_date, help="Inclusive start date (YYYY-MM-DD)")
+parser.add_argument("--end-date", type=parse_date, help="Inclusive end date (YYYY-MM-DD)")
+parser.add_argument("--business-center", help="Business center, for example Southwest")
+parser.add_argument(
+    "--snowflake-user",
+    help="Snowflake/identity provider login, for example TA48135@stellantis.com",
+)
+parser.add_argument(
+    "--recipient",
+    default="anthony.malgapo@stellantis.com",
+    help="Email recipient address; use multiple addresses separated by semicolons",
+)
+parser.add_argument("--cc", default="", help="Optional CC addresses separated by semicolons")
+parser.add_argument("--draft", action="store_true", help="Open an Outlook draft instead of sending the email")
+parser.add_argument("--base-file", help="Full path to the base Excel template")
+args = parser.parse_args()
+
+while True:
+    SNOWFLAKE_USER = (
+        args.snowflake_user.strip()
+        if args.snowflake_user and args.snowflake_user.strip()
+        else input("Snowflake user (for example, TA48135@stellantis.com): ").strip()
+    )
+    if SNOWFLAKE_USER:
+        break
+    print("Snowflake user is required.")
+
+while True:
+    BUSINESS_CENTER = (
+        args.business_center.strip()
+        if args.business_center and args.business_center.strip()
+        else input("Business center (for example, Southwest): ").strip()
+    )
+    if BUSINESS_CENTER:
+        break
+    print("Business center is required.")
+
+BUSINESS_CENTER_SQL = BUSINESS_CENTER.replace("'", "''")
+
+START_DATE = args.start_date or prompt_for_date("Start date", date(2026, 11, 3))
+END_DATE = args.end_date or prompt_for_date("End date", date(2026, 11, 30))
+
+if END_DATE < START_DATE:
+    parser.error("--end-date must be on or after --start-date")
+
+print(f"Reporting window: {START_DATE} through {END_DATE} (inclusive)")
 
 # --- Step 1: Connect to Snowflake and run five NPS queries ---
 print("Connecting to Snowflake...")
 conn = snowflake.connector.connect(
     account="nu14656-stellantis_aws_us_east_dataservices_prod",
-    user="TA23458@STELLANTIS.COM",
+    user=SNOWFLAKE_USER,
     authenticator="externalbrowser",
     role="N_RL_F_AFS_PUB_USER",
     warehouse="N_WH_AFTERSALES_REG",
@@ -24,8 +96,8 @@ cur = conn.cursor()
 
 # Explicit reporting window, filtered on date_survey_received (inclusive on both
 # ends) instead of the report_month column.
-START_DATE = date(2026, 11, 3)
-END_DATE = date(2026, 11, 30)
+# START_DATE = date(2026, 11, 3)
+# END_DATE = date(2026, 11, 30)
 
 # All five queries now run off MPR_CX_SERVICE_SURVEY_DETAILS_VW (one row per survey),
 # filtering on the real per-survey BRAND_CODE column (A=Alfa, C=Chrysler, D=Dodge,
@@ -129,7 +201,7 @@ cur.execute(f"""
         FROM DATALAKE_PROD.AFTERSALES.MPR_CX_SERVICE_SURVEY_DETAILS_VW
         WHERE market = 'USA'
           AND {BRAND_FILTER}
-          AND business_center_desc = 'Southwest'
+          AND business_center_desc = '{BUSINESS_CENTER_SQL}'
           AND date_survey_received BETWEEN '{START_DATE}' AND '{END_DATE}'
     ),
     agg AS (
@@ -195,7 +267,7 @@ cur.execute(f"""
         {TA_DISTRICT_JOIN}
         WHERE s.market = 'USA'
           AND {BRAND_FILTER}
-          AND s.business_center_desc = 'Southwest'
+          AND s.business_center_desc = '{BUSINESS_CENTER_SQL}'
           AND s.date_survey_received BETWEEN '{START_DATE}' AND '{END_DATE}'
     ),
     agg AS (
@@ -258,7 +330,7 @@ cur.execute(f"""
         FROM DATALAKE_PROD.AFTERSALES.MPR_CX_SERVICE_SURVEY_DETAILS_VW
         WHERE market = 'USA'
           AND {BRAND_FILTER}
-          AND business_center_desc = 'Southwest'
+          AND business_center_desc = '{BUSINESS_CENTER_SQL}'
           AND domestic_code in (21,22,23)
           AND date_survey_received BETWEEN '{START_DATE}' AND '{END_DATE}'
     ),
@@ -323,7 +395,7 @@ cur.execute(f"""
         {TA_DISTRICT_JOIN}
         WHERE s.market = 'USA'
           AND {BRAND_FILTER}
-          AND s.business_center_desc = 'Southwest'
+          AND s.business_center_desc = '{BUSINESS_CENTER}'
           AND s.date_survey_received BETWEEN '{START_DATE}' AND '{END_DATE}'
     ),
     agg AS (
@@ -396,10 +468,21 @@ conn.close()
 # row for every tab needs matching columns added before this script is run.
 # The TAs tab is new: if the base file doesn't have it yet, ensure_sheet_like()
 # creates it with the District tab's header row/formatting copied over.
-BASE_FILE_PATH = r"C:\Users\Ta23458\Documents\Base Files\NPS report Southwest 20261109 Base File.xlsx"
+BASE_FILE_PATH = args.base_file
+if not BASE_FILE_PATH:
+    base_dir = os.path.join(os.path.expanduser("~"), "Documents", "Base Files")
+    candidates = glob.glob(os.path.join(base_dir, f"NPS report {BUSINESS_CENTER}*Base File.xlsx"))
+    if candidates:
+        BASE_FILE_PATH = max(candidates, key=os.path.getmtime)
+    else:
+        parser.error(
+            f"No base Excel template found for {BUSINESS_CENTER} in {base_dir}. "
+            "Use --base-file with the full template path."
+        )
+BASE_FILE_PATH = os.path.abspath(BASE_FILE_PATH)
 
 wb = openpyxl.load_workbook(BASE_FILE_PATH)
-SOUTHWEST_HIGHLIGHT_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+BUSINESS_CENTER_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
 
 def overwrite_sheet_data(ws, rows):
@@ -523,8 +606,8 @@ overwrite_sheet_data(wb["Dealer"], dealer_rows)
 overwrite_sheet_data(wb["DOM"], dom_rows)
 overwrite_sheet_data(ensure_sheet_like(wb, "TAs", "District"), ta_dist_rows)
 
-# Highlight the Southwest row on the Business Center tab
-highlight_row_by_value(wb["Business Center"], 1, "Southwest", SOUTHWEST_HIGHLIGHT_FILL)
+# Highlight the selected business center row on the Business Center tab
+highlight_row_by_value(wb["Business Center"], 1, BUSINESS_CENTER, BUSINESS_CENTER_FILL)
 
 wb.save(BASE_FILE_PATH)
 print(f"Overwrote {BASE_FILE_PATH}")
@@ -533,13 +616,18 @@ print(f"Overwrote {BASE_FILE_PATH}")
 # If a file with that name already exists, append v2, v3, etc. instead of overwriting it.
 today_str = date.today().strftime("%Y%m%d")
 DATED_COPY_PATH = get_versioned_path(
-    os.path.join(os.path.dirname(BASE_FILE_PATH), f"NPS report Southwest {today_str}.xlsx")
+    os.path.join(os.path.dirname(BASE_FILE_PATH), f"NPS report {BUSINESS_CENTER} {today_str}.xlsx")
 )
 wb.save(DATED_COPY_PATH)
 print(f"Saved dated copy to {DATED_COPY_PATH}")
 
 # --- Step 3: Email the file via Outlook ---
-RECIPIENT = "JesseTest"
+RECIPIENT = args.recipient.strip()
+CC_RECIPIENTS = args.cc.strip()
+
+if not RECIPIENT:
+    parser.error("--recipient cannot be empty")
+
 EXCLUDED_EMAIL_COLUMNS = {
     "advocateshare", "neutralshare", "detractorshare",
     "maintenance_advocateshare", "maintenance_neutralshare", "maintenance_detractorshare",
@@ -571,7 +659,7 @@ def rows_to_html_table(title, columns, rows):
 
 html_body = (
     "<p>Hi Team,</p>"
-    "<p>Please see todays NPS Report below and attached.</p>"
+    "<p>Please see today's NPS Report below and attached.</p>"
     + rows_to_html_table("Business Center", bc_columns, bc_rows + [bc_total_row])
     + rows_to_html_table("District", dist_columns, dist_rows)
     + rows_to_html_table("TAs", ta_dist_columns, ta_dist_rows)
@@ -582,10 +670,17 @@ html_body = (
 outlook = win32com.client.Dispatch("Outlook.Application")
 mail = outlook.CreateItem(0)
 mail.To = RECIPIENT
-mail.Subject = f"NPS Report {date.today().strftime('%m/%d/%Y')}"
+if CC_RECIPIENTS:
+    mail.CC = CC_RECIPIENTS
+mail.Subject = f"NPS Report - {BUSINESS_CENTER}: {START_DATE} through {END_DATE}"
 mail.HTMLBody = html_body
 mail.Attachments.Add(os.path.abspath(DATED_COPY_PATH))
-mail.Send()
 
-print(f"Email sent to {RECIPIENT}")
+if args.draft:
+    mail.Display()
+    print(f"Outlook draft opened for {RECIPIENT}")
+else:
+    mail.Send()
+    print(f"Email sent to {RECIPIENT}")
+
 print("Done.")
